@@ -1,0 +1,23 @@
+BELDEN INNOVATE X - PHASE 2 ANALYSIS SUMMARY
+================================================================================
+
+Analysis Date: 2025-12-09 12:07:07
+
+Total Assets: 2000
+Critical Risks: 100
+Detection Rate: 5.0%
+
+Top Issues:
+1. PHYSICAL: Heat-Induced Cable Failure (17 cases)
+2. CONFIG: WLAN Configuration Issue - Good Signal but High Errors (15 cases)
+3. PHYSICAL: Thermal Degradation - Monitor Temperature (15 cases)
+4. SECURITY: Distributed Flood Attack / DDoS (EAGLE) (12 cases)
+5. PHYSICAL: Heat-Induced Port Flapping (Hirschmann) (9 cases)
+
+Model Accuracy: 78.3%
+
+Files Generated:
+- ai_health_report.csv (Critical assets report)
+- belden_network_logs_analyzed.csv (Complete analyzed dataset)
+- belden_ai_model.pkl (Trained AI model)
+- temporal_patterns.csv (Time-series insights)

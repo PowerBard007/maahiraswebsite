@@ -1,0 +1,17 @@
+Asset_ID,Pattern,Description
+PLC-ROBOT-01,SUDDEN_SPIKE,Sudden L2_Error_Frames spike detected - potential attack or fault
+CORE-SW-02,SUDDEN_SPIKE,Sudden L2_Error_Frames spike detected - potential attack or fault
+WLAN-AP-01,SUDDEN_SPIKE,Sudden L2_Error_Frames spike detected - potential attack or fault
+GATEWAY-02,SUDDEN_SPIKE,Sudden L2_Error_Frames spike detected - potential attack or fault
+SENSOR-HUB-02,SUDDEN_SPIKE,Sudden L2_Error_Frames spike detected - potential attack or fault
+PLC-ROBOT-02,SUDDEN_SPIKE,Sudden L2_Error_Frames spike detected - potential attack or fault
+EDGE-SW-01,SUDDEN_SPIKE,Sudden L2_Error_Frames spike detected - potential attack or fault
+GATEWAY-01,SUDDEN_SPIKE,Sudden L2_Error_Frames spike detected - potential attack or fault
+SENSOR-HUB-01,SUDDEN_SPIKE,Sudden L2_Error_Frames spike detected - potential attack or fault
+EDGE-SW-02,SUDDEN_SPIKE,Sudden L2_Error_Frames spike detected - potential attack or fault
+WLAN-AP-02,SUDDEN_SPIKE,Sudden L2_Error_Frames spike detected - potential attack or fault
+SEC-FW-01,SUDDEN_SPIKE,Sudden L2_Error_Frames spike detected - potential attack or fault
+SEC-FW-01,SUDDEN_SPIKE,Sudden MAC_Table_Count spike detected - potential attack or fault
+SEC-FW-02,SUDDEN_SPIKE,Sudden L2_Error_Frames spike detected - potential attack or fault
+SEC-FW-02,SUDDEN_SPIKE,Sudden MAC_Table_Count spike detected - potential attack or fault
+CORE-SW-01,SUDDEN_SPIKE,Sudden L2_Error_Frames spike detected - potential attack or fault

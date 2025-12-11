@@ -1,0 +1,1037 @@
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import IsolationForest
+import sys
+import joblib
+from datetime import datetime
+
+# ==================================================================================
+# CONFIGURATION & THRESHOLDS
+# ==================================================================================
+
+INPUT_FILE = 'belden_network_logs_final.csv'
+OUTPUT_ANOMALY_FILE = 'ai_health_report.csv'
+MODEL_FILE = 'belden_ai_model.pkl'
+
+# Threshold justification (based on industrial standards)
+TEMP_THRESHOLD_WARNING = 60   # °C - Copper cable rating typically 60-70°C
+TEMP_THRESHOLD_CRITICAL = 75  # °C - Cable insulation degradation begins
+RF_NOISE_THRESHOLD = -60      # dBm - Industrial WLAN interference threshold (IEEE 802.11)
+MAC_TABLE_THRESHOLD = 800     # entries - Typical switch CAM table flood indicator
+LINK_FLAP_THRESHOLD = 5       # count - Indicates unstable connection
+DPI_LATENCY_THRESHOLD = 50    # ms - Deep packet inspection acceptable latency
+PROTOCOL_CONV_THRESHOLD = 100 # ms - Gateway protocol conversion time limit
+L3_LATENCY_WARNING = 40       # ms - Network latency warning threshold
+L3_LATENCY_CRITICAL = 50      # ms - Network latency critical threshold
+L7_RESPONSE_THRESHOLD = 100   # ms - Application response time limit
+
+# Feature list - All 11 Belden-specific KPIs from Phase 1
+FEATURES = [
+    'L1_Numeric_Val',           # Physical layer: Cable health/CRC errors
+    'L2_Error_Frames',          # Data link: Switching errors
+    'MAC_Table_Count',          # EAGLE40: MAC table entries (DDoS indicator)
+    'Link_Flaps',               # Hirschmann: Port stability
+    'RSSI',                     # BAT867 WLAN: Signal strength
+    'SNR',                      # BAT867 WLAN: Signal-to-noise ratio
+    'DPI_Latency_ms',           # EAGLE40: Deep packet inspection delay
+    'Protocol_Conversion_Time', # OpEdge-8D: Gateway protocol translation
+    'L3_Latency_ms',            # Network layer: Routing latency
+    'L7_App_Response_ms',       # Application layer: Protocol response
+    'Env_Temp_C',               # Environmental twin: Temperature
+    'RF_Noise_dBm'              # Wireless twin: Interference level
+]
+
+# ==================================================================================
+# ROOT CAUSE CLASSIFICATION - ASSET-SPECIFIC LOGIC
+# ==================================================================================
+
+def classify_root_cause_enhanced(row):
+    """
+    Implements comprehensive root cause analysis with:
+    1. Belden asset-specific logic (Hirschmann, EAGLE, BAT867, OpEdge)
+    2. Security vs. Physical failure fingerprinting (Phase 1 requirement)
+    3. Physics-aware correlation (Environmental Digital Twin)
+    """
+    
+    # If AI says it's normal, no root cause needed
+    if row['AI_Risk_Assessment'] == 'Stable':
+        return 'None'
+    
+    asset_model = row.get('Asset_Model', '')
+    asset_type = row.get('Asset_Type', '')
+    
+    # Extract key metrics
+    l1_errors = row.get('L1_Numeric_Val', 0)
+    l2_errors = row.get('L2_Error_Frames', 0)
+    mac_count = row.get('MAC_Table_Count', 0)
+    link_flaps = row.get('Link_Flaps', 0)
+    l3_latency = row.get('L3_Latency_ms', 0)
+    l7_response = row.get('L7_App_Response_ms', 0)
+    temp = row.get('Env_Temp_C', 0)
+    rf_noise = row.get('RF_Noise_dBm', -100)
+    rssi = row.get('RSSI', -70)
+    snr = row.get('SNR', 30)
+    dpi_latency = row.get('DPI_Latency_ms', 0)
+    protocol_time = row.get('Protocol_Conversion_Time', 0)
+    
+    # -------------------------------------------------------------------------
+    # HIRSCHMANN SWITCH LOGIC (Wired Infrastructure)
+    # -------------------------------------------------------------------------
+    if 'Hirschmann' in asset_model or 'BOBCAT' in asset_model or asset_type == 'Switch':
+        
+        # Port Instability - Link Flapping
+        if link_flaps > LINK_FLAP_THRESHOLD:
+            if temp > TEMP_THRESHOLD_CRITICAL:
+                return 'PHYSICAL: Heat-Induced Port Flapping (Hirschmann)'
+            elif temp > TEMP_THRESHOLD_WARNING:
+                return 'PHYSICAL: Thermal Stress on Switch Port (Hirschmann)'
+            else:
+                return 'PHYSICAL: Cable/Connector Damage (Hirschmann Port)'
+        
+        # Switching Fabric Overload
+        if l2_errors > 100:
+            if mac_count > MAC_TABLE_THRESHOLD:
+                return 'SECURITY: Switch Under Attack + Fabric Overload'
+            else:
+                return 'CONFIG: Switch Backplane Congestion (Check VLAN Config)'
+        
+        # Cable degradation without flapping
+        if l1_errors > 20 and link_flaps <= LINK_FLAP_THRESHOLD:
+            return 'PHYSICAL: Progressive Cable Degradation (Hirschmann)'
+    
+    # -------------------------------------------------------------------------
+    # EAGLE FIREWALL LOGIC (Security Gateway)
+    # -------------------------------------------------------------------------
+    elif 'EAGLE' in asset_model or asset_type == 'Firewall':
+        
+        # MAC Flooding Attack (Phase 1's key security fingerprint)
+        if mac_count > MAC_TABLE_THRESHOLD and l1_errors == 0:
+            if mac_count > 1000:
+                return 'SECURITY: Severe MAC Flooding / CAM Table Attack (EAGLE)'
+            else:
+                return 'SECURITY: MAC Table Overflow Detected (EAGLE)'
+        
+        # Deep Packet Inspection Bottleneck
+        if dpi_latency > DPI_LATENCY_THRESHOLD:
+            if l3_latency > L3_LATENCY_CRITICAL:
+                return 'SECURITY: DPI Overload Causing Network Slowdown (EAGLE)'
+            else:
+                return 'SECURITY: DPI Engine Saturated - Consider Rule Optimization (EAGLE)'
+        
+        # Firewall under DDoS without MAC flooding
+        if l3_latency > L3_LATENCY_CRITICAL and l2_errors > 50 and l1_errors < 5:
+            return 'SECURITY: Distributed Flood Attack / DDoS (EAGLE)'
+    
+    # -------------------------------------------------------------------------
+    # BELDEN WLAN LOGIC (Wireless Access Point)
+    # -------------------------------------------------------------------------
+    elif 'BAT867' in asset_model or asset_type == 'WLAN_AP':
+        
+        # RF Interference / Jamming
+        if rf_noise > RF_NOISE_THRESHOLD and snr < 20:
+            if rf_noise > -50:
+                return 'PHYSICAL: Severe RF Interference / Potential Jamming (WLAN)'
+            else:
+                return 'PHYSICAL: RF Interference Detected (WLAN)'
+        
+        # Weak Signal Strength
+        if rssi < -75:
+            if rssi < -85:
+                return 'PHYSICAL: Critical Signal Loss - AP Placement Issue (WLAN)'
+            else:
+                return 'PHYSICAL: Weak Signal Strength - Check AP Coverage (WLAN)'
+        
+        # WLAN-specific errors with good signal
+        if l2_errors > 30 and rssi > -70:
+            return 'CONFIG: WLAN Configuration Issue - Good Signal but High Errors'
+    
+    # -------------------------------------------------------------------------
+    # OPEDGE GATEWAY LOGIC (IIoT Protocol Gateway)
+    # -------------------------------------------------------------------------
+    elif 'OpEdge' in asset_model or asset_type == 'Gateway':
+        
+        # Protocol Conversion Bottleneck
+        if protocol_time > PROTOCOL_CONV_THRESHOLD:
+            if protocol_time > 200:
+                return 'APP: Severe Protocol Translation Bottleneck (Gateway)'
+            else:
+                return 'APP: Protocol Conversion Delay - Gateway Overload'
+        
+        # Gateway with network issues
+        if l3_latency > L3_LATENCY_CRITICAL and protocol_time < PROTOCOL_CONV_THRESHOLD:
+            return 'NETWORK: Gateway Connectivity Issue - Check Upstream'
+    
+    # -------------------------------------------------------------------------
+    # GENERIC CROSS-ASSET LOGIC (Fallback for all assets)
+    # -------------------------------------------------------------------------
+    
+    # Physical Failure Signature (Phase 1): High L1 Errors + Normal MAC Table
+    if l1_errors > 10 and mac_count < 500:
+        if temp > TEMP_THRESHOLD_CRITICAL:
+            return 'PHYSICAL: Heat-Induced Cable Failure'
+        elif temp > TEMP_THRESHOLD_WARNING:
+            return 'PHYSICAL: Thermal Degradation - Monitor Temperature'
+        else:
+            return 'PHYSICAL: Cable/Connector Physical Damage'
+    
+    # Cyber Attack Signature (Phase 1): Zero L1 Errors + High MAC Table
+    if l1_errors == 0 and mac_count > MAC_TABLE_THRESHOLD:
+        return 'SECURITY: Suspected Network Attack - MAC Flooding'
+    
+    # DDoS without MAC flooding
+    if l1_errors < 5 and l3_latency > L3_LATENCY_CRITICAL and l2_errors > 100:
+        return 'SECURITY: Distributed Denial of Service (DDoS)'
+    
+    # Application Layer Issues (L7 slow but network fine)
+    if l7_response > L7_RESPONSE_THRESHOLD and l3_latency < L3_LATENCY_WARNING:
+        if l7_response > 200:
+            return 'APP: Server Critical Overload / Software Hang'
+        else:
+            return 'APP: Application Performance Degradation'
+    
+    # Configuration Issues (High latency, no physical problems)
+    if l1_errors == 0 and l3_latency > L3_LATENCY_CRITICAL and mac_count < 500:
+        return 'CONFIG: Network Routing/VLAN Misconfiguration'
+    
+    # Default fallback for complex unknown anomalies
+    return 'UNKNOWN: Complex Multi-Layer Issue - Requires Manual Inspection'
+
+# ==================================================================================
+# CONFIDENCE SCORING
+# ==================================================================================
+
+def assign_confidence_level(row):
+    """
+    Assigns confidence percentage to diagnoses based on signal strength.
+    Makes the system more actionable for operators.
+    """
+    
+    root_cause = row['Root_Cause']
+    
+    if root_cause == 'None':
+        return 'N/A'
+    
+    # High confidence conditions
+    if 'PHYSICAL: Heat' in root_cause:
+        temp = row.get('Env_Temp_C', 0)
+        l1 = row.get('L1_Numeric_Val', 0)
+        if temp > 70 and l1 > 50:
+            return 'HIGH (95%)'
+        elif temp > 65 and l1 > 30:
+            return 'HIGH (85%)'
+        elif temp > TEMP_THRESHOLD_WARNING:
+            return 'MEDIUM (75%)'
+        else:
+            return 'LOW (55%)'
+    
+    if 'SECURITY: MAC' in root_cause or 'MAC Flooding' in root_cause:
+        mac_count = row.get('MAC_Table_Count', 0)
+        if mac_count > 1000:
+            return 'HIGH (95%)'
+        elif mac_count > 900:
+            return 'HIGH (85%)'
+        elif mac_count > MAC_TABLE_THRESHOLD:
+            return 'MEDIUM (70%)'
+        else:
+            return 'LOW (55%)'
+    
+    if 'RF Interference' in root_cause or 'Jamming' in root_cause:
+        rf_noise = row.get('RF_Noise_dBm', -100)
+        snr = row.get('SNR', 30)
+        if rf_noise > -50 and snr < 15:
+            return 'HIGH (90%)'
+        elif rf_noise > RF_NOISE_THRESHOLD and snr < 20:
+            return 'MEDIUM (75%)'
+        else:
+            return 'LOW (60%)'
+    
+    if 'DDoS' in root_cause or 'Flood Attack' in root_cause:
+        l3 = row.get('L3_Latency_ms', 0)
+        l2 = row.get('L2_Error_Frames', 0)
+        if l3 > 60 and l2 > 150:
+            return 'HIGH (85%)'
+        elif l3 > L3_LATENCY_CRITICAL:
+            return 'MEDIUM (70%)'
+        else:
+            return 'LOW (55%)'
+    
+    # Default confidence for other diagnoses
+    if 'CRITICAL' in row['AI_Risk_Assessment']:
+        return 'MEDIUM (65%)'
+    else:
+        return 'MEDIUM (60%)'
+
+# ==================================================================================
+# SEVERITY ASSIGNMENT
+# ==================================================================================
+
+def assign_severity(row):
+    """
+    Converts binary risk assessment to graduated severity levels.
+    Provides actionable priority levels for operators.
+    """
+    
+    if row['AI_Risk_Assessment'] == 'Stable':
+        return 'NORMAL'
+    
+    root_cause = row['Root_Cause']
+    temp = row.get('Env_Temp_C', 0)
+    l1 = row.get('L1_Numeric_Val', 0)
+    l3 = row.get('L3_Latency_ms', 0)
+    l7 = row.get('L7_App_Response_ms', 0)
+    
+    # CRITICAL: Immediate production impact
+    if 'Heat' in root_cause and temp > TEMP_THRESHOLD_CRITICAL:
+        return 'CRITICAL'
+    
+    if 'DDoS' in root_cause or 'Severe' in root_cause:
+        return 'CRITICAL'
+    
+    if 'Jamming' in root_cause:
+        return 'CRITICAL'
+    
+    if l1 > 50 or l7 > 200:
+        return 'CRITICAL'
+    
+    # HIGH: Degraded performance, needs urgent attention
+    if l3 > L3_LATENCY_CRITICAL or l1 > 30:
+        return 'HIGH'
+    
+    if 'Overload' in root_cause or 'Bottleneck' in root_cause:
+        return 'HIGH'
+    
+    if temp > TEMP_THRESHOLD_WARNING:
+        return 'HIGH'
+    
+    # MEDIUM: Requires attention, schedule maintenance
+    if l1 > 10 or l3 > L3_LATENCY_WARNING:
+        return 'MEDIUM'
+    
+    if 'CONFIG' in root_cause or 'Weak Signal' in root_cause:
+        return 'MEDIUM'
+    
+    # LOW: Monitor situation
+    return 'LOW'
+
+# ==================================================================================
+# TOPOLOGY ANALYSIS
+# ==================================================================================
+
+def analyze_topology_impact(df):
+    """
+    Distinguishes root cause from collateral damage using uplink relationships.
+    Solves the "Asset Sprawl" problem by identifying cascading failures.
+    """
+    
+    if 'uplink' not in df.columns:
+        print("Note: No topology data (uplink field) found. Skipping topology analysis.")
+        return df
+    
+    # Create a copy to avoid modifying original
+    df['Root_Cause_Original'] = df['Root_Cause'].copy()
+    df['Is_Cascading_Failure'] = False
+    
+    # Build parent-child lookup
+    uplink_map = dict(zip(df['Asset_ID'], df['uplink']))
+    
+    # For each critical risk asset
+    critical_assets = df[df['AI_Risk_Assessment'] == 'CRITICAL_RISK']['Asset_ID'].unique()
+    
+    for asset_id in critical_assets:
+        # Check if its parent is also failing
+        parent = uplink_map.get(asset_id, 'Unknown')
+        
+        if parent and parent != 'Cloud' and parent != 'Unknown':
+            parent_data = df[df['Asset_ID'] == parent]
+            
+            if len(parent_data) > 0:
+                parent_status = parent_data['AI_Risk_Assessment'].values[0]
+                
+                if parent_status == 'CRITICAL_RISK':
+                    # This is likely collateral damage, not independent failure
+                    mask = df['Asset_ID'] == asset_id
+                    df.loc[mask, 'Is_Cascading_Failure'] = True
+                    df.loc[mask, 'Root_Cause'] = f'CASCADING: Downstream Impact from {parent}'
+    
+    return df
+
+# ==================================================================================
+# TEMPORAL PATTERN DETECTION
+# ==================================================================================
+
+def detect_temporal_patterns(df):
+    """
+    Analyzes time-series patterns to improve root cause accuracy.
+    Implements Phase 1's promised temporal correlation:
+    "If Vibration spikes at 10:00 AM and Connection Loss happens at 10:01 AM"
+    """
+    
+    if 'Timestamp' not in df.columns:
+        print("Note: No timestamp data found. Skipping temporal analysis.")
+        return pd.DataFrame()
+    
+    df['Timestamp'] = pd.to_datetime(df['Timestamp'], errors='coerce')
+    df = df.sort_values('Timestamp')
+    
+    temporal_insights = []
+    
+    for asset_id in df['Asset_ID'].unique():
+        asset_data = df[df['Asset_ID'] == asset_id].sort_values('Timestamp').copy()
+        
+        if len(asset_data) < 2:
+            continue
+        
+        # Calculate time deltas for rate-of-change analysis
+        time_diff = asset_data['Timestamp'].diff().dt.total_seconds()
+        
+        # Avoid division by zero
+        time_diff = time_diff.replace(0, np.nan)
+        
+        # Calculate rate of change for key metrics
+        asset_data['Temp_Change_Rate'] = asset_data['Env_Temp_C'].diff() / time_diff
+        asset_data['L1_Degradation_Rate'] = asset_data['L1_Numeric_Val'].diff() / time_diff
+        
+        # Detect rapid deterioration (Phase 1's "vibration at 10:00, failure at 10:01")
+        rapid_failures = asset_data[
+            (asset_data['Temp_Change_Rate'] > 2) &  # Fast heating (>2°C per second)
+            (asset_data['L1_Degradation_Rate'] > 5)  # Simultaneous signal loss
+        ]
+        
+        if len(rapid_failures) > 0:
+            for idx, row in rapid_failures.iterrows():
+                temporal_insights.append({
+                    'Asset_ID': asset_id,
+                    'Timestamp': row['Timestamp'],
+                    'Pattern': 'RAPID_DEGRADATION',
+                    'Description': f'Temperature spike ({row["Temp_Change_Rate"]:.1f}°C/s) '
+                                   f'preceded failure - ACUTE event'
+                })
+        
+        # Detect progressive wear (monotonic degradation)
+        if len(asset_data) >= 3:
+            l1_values = asset_data['L1_Numeric_Val'].values
+            if np.all(np.diff(l1_values) >= 0) and l1_values[-1] > 20:
+                temporal_insights.append({
+                    'Asset_ID': asset_id,
+                    'Pattern': 'PROGRESSIVE_WEAR',
+                    'Description': f'Gradual signal degradation over {len(asset_data)} observations - CHRONIC issue'
+                })
+        
+        # Detect sudden spikes (potential attacks)
+        for col in ['L2_Error_Frames', 'MAC_Table_Count']:
+            if col in asset_data.columns:
+                mean_val = asset_data[col].mean()
+                std_val = asset_data[col].std()
+                
+                if std_val > 0:
+                    spikes = asset_data[asset_data[col] > (mean_val + 3 * std_val)]
+                    
+                    if len(spikes) > 0:
+                        temporal_insights.append({
+                            'Asset_ID': asset_id,
+                            'Pattern': 'SUDDEN_SPIKE',
+                            'Description': f'Sudden {col} spike detected - potential attack or fault'
+                        })
+    
+    return pd.DataFrame(temporal_insights)
+
+# ==================================================================================
+# MODEL VALIDATION
+# ==================================================================================
+
+def validate_ai_performance(df):
+    """
+    Validates AI predictions against Phase 1's ground truth scenarios.
+    Demonstrates model effectiveness with accuracy metrics.
+    """
+    
+    # Check if ground truth exists (Phase 1 should have labeled scenarios)
+    if 'Scenario_Type' not in df.columns and 'Ground_Truth' not in df.columns:
+        print("Note: No ground truth labels found. Cannot validate accuracy.")
+        print("      (This is normal if Phase 1 didn't generate scenario labels)")
+        return None
+    
+    # Determine which column has ground truth
+    truth_col = 'Scenario_Type' if 'Scenario_Type' in df.columns else 'Ground_Truth'
+    
+    # Map Phase 1 scenarios to expected diagnoses
+    scenario_mapping = {
+        'Heat_Wave': 'PHYSICAL: Heat',
+        'Vibration_Spike': 'PHYSICAL:',
+        'DDoS_Attack': 'SECURITY:',
+        'MAC_Flood': 'SECURITY: MAC',
+        'RF_Interference': 'PHYSICAL: RF',
+        'Normal_Operation': 'None',
+        'Normal': 'None'
+    }
+    
+    correct_predictions = 0
+    total_labeled = 0
+    results = []
+    
+    for scenario, expected_prefix in scenario_mapping.items():
+        scenario_data = df[df[truth_col] == scenario]
+        
+        if len(scenario_data) == 0:
+            continue
+        
+        total_labeled += len(scenario_data)
+        
+        # Check if root cause contains expected keywords
+        correct = scenario_data['Root_Cause'].str.contains(expected_prefix, case=False, na=False).sum()
+        correct_predictions += correct
+        
+        accuracy = 100 * correct / len(scenario_data) if len(scenario_data) > 0 else 0
+        
+        results.append({
+            'Scenario': scenario,
+            'Total': len(scenario_data),
+            'Correct': correct,
+            'Accuracy': f'{accuracy:.1f}%'
+        })
+        
+        print(f"  {scenario:20s}: {correct:3d}/{len(scenario_data):3d} correctly identified ({accuracy:.1f}%)")
+    
+    if total_labeled > 0:
+        overall_accuracy = 100 * correct_predictions / total_labeled
+        print(f"\n  *Overall AI Accuracy: {overall_accuracy:.1f}%*")
+        
+        return overall_accuracy
+    else:
+        return None
+
+# ==================================================================================
+# MAIN AI ANALYSIS PIPELINE
+# ==================================================================================
+
+def run_ai_analysis():
+    """
+    Main execution pipeline for Phase 2 AI Analysis.
+    Orchestrates all analysis components.
+    """
+    
+    print("="*80)
+    print("BELDEN INNOVATE X - PHASE 2: AI-DRIVEN INTELLIGENCE LAYER")
+    print("="*80)
+    print(f"Analysis started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    
+    # -------------------------------------------------------------------------
+    # STEP 1: DATA LOADING & VALIDATION
+    # -------------------------------------------------------------------------
+    print(f"[1/8] Loading data from {INPUT_FILE}...")
+    
+    try:
+        df = pd.read_csv(INPUT_FILE)
+        print(f"      ✓ Loaded {len(df)} records")
+        
+        # Validate required columns
+        required_cols = ['Asset_ID', 'Asset_Model', 'L1_Numeric_Val', 'L2_Error_Frames']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        
+        if missing_cols:
+            raise ValueError(f"Phase 1 data missing required columns: {missing_cols}")
+        
+        # Check for optional but important columns
+        optional_cols = ['Timestamp', 'uplink', 'Scenario_Type']
+        for col in optional_cols:
+            if col not in df.columns:
+                print(f"      ⚠ Optional column '{col}' not found - some features will be limited")
+        
+    except FileNotFoundError:
+        print(f"      ✗ ERROR: {INPUT_FILE} not found.")
+        print(f"      → Please run Phase 1 data generation first.")
+        sys.exit(1)
+    except ValueError as e:
+        print(f"      ✗ ERROR: {e}")
+        print(f"      → Check Phase 1 output format.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"      ✗ ERROR: Unexpected error loading data: {e}")
+        sys.exit(1)
+    
+    # -------------------------------------------------------------------------
+    # STEP 2: FEATURE ENGINEERING
+    # -------------------------------------------------------------------------
+    print("\n[2/8] Preparing features for AI analysis...")
+    
+    # Select features - handle missing columns gracefully
+    available_features = [f for f in FEATURES if f in df.columns]
+    missing_features = [f for f in FEATURES if f not in df.columns]
+    
+    if missing_features:
+        print(f"      ⚠ Missing features (will use defaults): {missing_features}")
+    
+    print(f"      ✓ Using {len(available_features)} features: {available_features}")
+    
+    # Create feature dataframe
+    df_ai = df[available_features].copy()
+    
+    # Handle missing values intelligently
+    fillna_values = {
+        'RSSI': 0,                      # Wired devices don't have RSSI
+        'SNR': 0,                       # Wired devices don't have SNR
+        'RF_Noise_dBm': -100,           # Default "no interference"
+        'MAC_Table_Count': 0,           # Default for non-firewall devices
+        'Link_Flaps': 0,                # Default for stable connections
+        'DPI_Latency_ms': 0,            # Default for non-firewall devices
+        'Protocol_Conversion_Time': 0,  # Default for non-gateway devices
+        'L1_Numeric_Val': 0,
+        'L2_Error_Frames': 0,
+        'L3_Latency_ms': 0,
+        'L7_App_Response_ms': 0,
+        'Env_Temp_C': 25                # Assume room temperature if missing
+    }
+    
+    for col, val in fillna_values.items():
+        if col in df_ai.columns:
+            df_ai[col].fillna(val, inplace=True)
+    
+    print(f"      ✓ Feature engineering complete")
+    
+    # -------------------------------------------------------------------------
+    # STEP 3: AI MODEL TRAINING
+    # -------------------------------------------------------------------------
+    print("\n[3/8] Training AI model (Isolation Forest)...")
+    
+    # Initialize Isolation Forest
+    # Contamination=0.05 implies we expect ~5% of data to be anomalous
+    model = IsolationForest(
+        n_estimators=100,
+        contamination=0.05,
+        random_state=42,
+        n_jobs=-1  # Use all CPU cores
+    )
+    
+    model.fit(df_ai)
+    print(f"      ✓ Model trained on {len(df_ai)} samples")
+    
+    # Save model for future use
+    try:
+        joblib.dump(model, MODEL_FILE)
+        print(f"      ✓ Model saved to {MODEL_FILE}")
+    except Exception as e:
+        print(f"      ⚠ Could not save model: {e}")
+    
+    # -------------------------------------------------------------------------
+    # STEP 4: ANOMALY DETECTION
+    # -------------------------------------------------------------------------
+    print("\n[4/8] Detecting anomalies...")
+    
+    # Predict anomalies (-1 = Anomaly, 1 = Normal)
+    df_ai['anomaly_score'] = model.predict(df_ai)
+    
+    # Get decision function scores (lower = more anomalous)
+    df_ai['anomaly_score_raw'] = model.decision_function(df_ai)
+    
+    # Map to readable status
+    df['AI_Risk_Assessment'] = df_ai['anomaly_score'].apply(
+        lambda x: 'CRITICAL_RISK' if x == -1 else 'Stable'
+    )
+    df['Anomaly_Score'] = df_ai['anomaly_score_raw']
+    
+    anomalies = df[df['AI_Risk_Assessment'] == 'CRITICAL_RISK']
+    print(f"      ✓ Detected {len(anomalies)} anomalies out of {len(df)} samples ({100*len(anomalies)/len(df):.1f}%)")
+    
+    # -------------------------------------------------------------------------
+    # STEP 5: ROOT CAUSE ANALYSIS
+    # -------------------------------------------------------------------------
+    print("\n[5/8] Performing root cause analysis...")
+    
+    df['Root_Cause'] = df.apply(classify_root_cause_enhanced, axis=1)
+    df['Confidence'] = df.apply(assign_confidence_level, axis=1)
+    df['Severity'] = df.apply(assign_severity, axis=1)
+    
+    print(f"      ✓ Root cause classification complete")
+    
+    # -------------------------------------------------------------------------
+    # STEP 6: TOPOLOGY ANALYSIS
+    # -------------------------------------------------------------------------
+    print("\n[6/8] Analyzing network topology...")
+    
+    df = analyze_topology_impact(df)
+    
+    if 'Is_Cascading_Failure' in df.columns:
+        cascading = df[df['Is_Cascading_Failure'] == True]
+        primary = df[(df['AI_Risk_Assessment'] == 'CRITICAL_RISK') & (df['Is_Cascading_Failure'] == False)]
+        print(f"      ✓ Identified {len(primary)} primary failures and {len(cascading)} cascading failures")
+    
+    # -------------------------------------------------------------------------
+    # STEP 7: TEMPORAL ANALYSIS
+    # -------------------------------------------------------------------------
+    print("\n[7/8] Detecting temporal patterns...")
+    
+    temporal_df = detect_temporal_patterns(df)
+    
+    if not temporal_df.empty:
+        print(f"      ✓ Detected {len(temporal_df)} temporal patterns")
+        
+        # Enhance root causes with temporal context
+        for idx, t_row in temporal_df.iterrows():
+            mask = (df['Asset_ID'] == t_row['Asset_ID'])
+            if t_row['Pattern'] == 'RAPID_DEGRADATION':
+                df.loc[mask, 'Root_Cause'] = df.loc[mask, 'Root_Cause'] + ' [ACUTE]'
+            elif t_row['Pattern'] == 'PROGRESSIVE_WEAR':
+                df.loc[mask, 'Root_Cause'] = df.loc[mask, 'Root_Cause'] + ' [CHRONIC]'
+    else:
+        print(f"      ✓ No significant temporal patterns detected")
+    
+    # -------------------------------------------------------------------------
+    # STEP 8: MODEL VALIDATION
+    # -------------------------------------------------------------------------
+    print("\n[8/8] Validating AI performance...")
+    
+    accuracy = validate_ai_performance(df)
+    
+    # -------------------------------------------------------------------------
+    # GENERATE REPORTS
+    # -------------------------------------------------------------------------
+    print("\n" + "="*80)
+    print("ANALYSIS RESULTS & INSIGHTS")
+    print("="*80)
+    
+    if len(anomalies) > 0:
+        print(f"\n📊 EXECUTIVE SUMMARY")
+        print("-" * 80)
+        print(f"Total Assets Monitored    : {len(df)}")
+        print(f"Risks Detected            : {len(anomalies)} ({100*len(anomalies)/len(df):.1f}%)")
+        print(f"Healthy Assets            : {len(df) - len(anomalies)} ({100*(len(df)-len(anomalies))/len(df):.1f}%)")
+        
+        # Severity breakdown
+        print(f"\n🚨 SEVERITY BREAKDOWN")
+        print("-" * 80)
+        severity_counts = df['Severity'].value_counts()
+        for severity in ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'NORMAL']:
+            count = severity_counts.get(severity, 0)
+            if count > 0:
+                print(f"  {severity:10s}: {count:4d} assets ({100*count/len(df):5.1f}%)")
+        
+        # Root cause summary
+        print(f"\n🔍 ROOT CAUSE ANALYSIS")
+        print("-" * 80)
+        root_cause_counts = anomalies['Root_Cause'].value_counts().head(10)
+        print("Top 10 Issues Detected:")
+        for idx, (cause, count) in enumerate(root_cause_counts.items(), 1):
+            print(f"  {idx:2d}. {cause:60s} : {count:3d} cases")
+        
+        # Asset type breakdown
+        print(f"\n🏭 RISK BY ASSET TYPE")
+        print("-" * 80)
+        if 'Asset_Model' in anomalies.columns:
+            asset_risks = anomalies['Asset_Model'].value_counts().head(10)
+            print("Most affected Belden assets:")
+            for idx, (asset, count) in enumerate(asset_risks.items(), 1):
+                print(f"  {idx:2d}. {asset:40s} : {count:3d} issues")
+        
+        # Category breakdown
+        print(f"\n📋 ISSUE CATEGORIES")
+        print("-" * 80)
+        categories = {
+            'PHYSICAL': 0,
+            'SECURITY': 0,
+            'CONFIG': 0,
+            'APP': 0,
+            'NETWORK': 0,
+            'CASCADING': 0,
+            'UNKNOWN': 0
+        }
+        
+        for cause in anomalies['Root_Cause']:
+            for category in categories.keys():
+                if category in cause:
+                    categories[category] += 1
+                    break
+        
+        for category, count in sorted(categories.items(), key=lambda x: x[1], reverse=True):
+            if count > 0:
+                percentage = 100 * count / len(anomalies)
+                print(f"  {category:15s}: {count:4d} issues ({percentage:5.1f}%)")
+        
+        # Confidence distribution
+        print(f"\n📈 DIAGNOSTIC CONFIDENCE")
+        print("-" * 80)
+        confidence_counts = anomalies['Confidence'].value_counts()
+        for conf in ['HIGH (95%)', 'HIGH (90%)', 'HIGH (85%)', 'MEDIUM (75%)', 'MEDIUM (70%)', 'MEDIUM (65%)', 'MEDIUM (60%)', 'LOW (60%)', 'LOW (55%)', 'LOW (50%)']:
+            count = confidence_counts.get(conf, 0)
+            if count > 0:
+                print(f"  {conf:15s}: {count:4d} diagnoses")
+        
+        # Topology insights (if available)
+        if 'Is_Cascading_Failure' in df.columns:
+            cascading = df[df['Is_Cascading_Failure'] == True]
+            primary = df[(df['AI_Risk_Assessment'] == 'CRITICAL_RISK') & (df['Is_Cascading_Failure'] == False)]
+            
+            if len(cascading) > 0:
+                print(f"\n🔗 TOPOLOGY INSIGHTS")
+                print("-" * 80)
+                print(f"Primary Failures          : {len(primary)} (Root causes)")
+                print(f"Cascading Failures        : {len(cascading)} (Downstream impacts)")
+                print(f"\n💡 RECOMMENDATION: Focus maintenance on these {len(primary)} primary failure points")
+                print("   to restore {len(cascading)} dependent assets.")
+                
+                if len(primary) > 0:
+                    print(f"\nCritical assets requiring immediate attention:")
+                    for idx, row in primary.head(5).iterrows():
+                        print(f"  • {row['Asset_ID']:20s} ({row['Asset_Model']:30s}) - {row['Root_Cause']}")
+        
+        # Temporal insights (if available)
+        if not temporal_df.empty:
+            print(f"\n⏱  TEMPORAL PATTERNS")
+            print("-" * 80)
+            pattern_counts = temporal_df['Pattern'].value_counts()
+            for pattern, count in pattern_counts.items():
+                print(f"  {pattern:20s}: {count} assets")
+            
+            print(f"\nSample temporal findings:")
+            for idx, row in temporal_df.head(5).iterrows():
+                print(f"  • {row['Asset_ID']:20s}: {row['Description']}")
+        
+        # Top critical assets
+        print(f"\n🚨 TOP 10 CRITICAL ASSETS (Most Anomalous)")
+        print("-" * 80)
+        critical_top = df.nsmallest(10, 'Anomaly_Score')[
+            ['Asset_ID', 'Asset_Model', 'Severity', 'Root_Cause', 'Confidence', 'Anomaly_Score']
+        ]
+        print(critical_top.to_string(index=False))
+        
+        # Feature correlation analysis (replacement for feature importance)
+        print(f"\n📊 FEATURE CORRELATION WITH ANOMALIES")
+        print("-" * 80)
+        df_with_anomalies = df_ai.copy()
+        df_with_anomalies['is_anomaly'] = (df['AI_Risk_Assessment'] == 'CRITICAL_RISK').astype(int)
+        
+        if len(df_with_anomalies) > 1:
+            correlations = df_with_anomalies[available_features + ['is_anomaly']].corr()['is_anomaly'].drop('is_anomaly')
+            correlations_sorted = correlations.abs().sort_values(ascending=False)
+            
+            print("Features most correlated with failures:")
+            for idx, (feature, corr) in enumerate(correlations_sorted.head(5).items(), 1):
+                direction = "↑ Higher" if correlations[feature] > 0 else "↓ Lower"
+                print(f"  {idx}. {feature:30s}: {abs(corr):.3f} ({direction} values indicate risk)")
+            
+            print(f"\nStrongest risk predictor: {correlations_sorted.index[0]} (correlation: {correlations_sorted.iloc[0]:.3f})")
+        
+        # Save detailed report
+        print(f"\n💾 SAVING DETAILED REPORTS")
+        print("-" * 80)
+        
+        try:
+            # Save full anomaly report
+            output_columns = [
+                'Timestamp', 'Asset_ID', 'Asset_Model', 'Asset_Type', 'Location',
+                'AI_Risk_Assessment', 'Severity', 'Root_Cause', 'Confidence',
+                'Anomaly_Score', 'L1_Numeric_Val', 'L2_Error_Frames', 'L3_Latency_ms',
+                'L7_App_Response_ms', 'Env_Temp_C', 'MAC_Table_Count', 'Link_Flaps',
+                'RSSI', 'SNR', 'RF_Noise_dBm'
+            ]
+            
+            # Only include columns that exist
+            output_columns = [col for col in output_columns if col in anomalies.columns]
+            
+            anomalies[output_columns].to_csv(OUTPUT_ANOMALY_FILE, index=False)
+            print(f"  ✓ Anomaly report saved: {OUTPUT_ANOMALY_FILE}")
+            print(f"    ({len(anomalies)} critical assets, {len(output_columns)} columns)")
+            
+            # Save temporal patterns if available
+            if not temporal_df.empty:
+                temporal_file = 'temporal_patterns.csv'
+                temporal_df.to_csv(temporal_file, index=False)
+                print(f"  ✓ Temporal patterns saved: {temporal_file}")
+            
+            # Save full enriched dataset
+            full_output = 'belden_network_logs_analyzed.csv'
+            df.to_csv(full_output, index=False)
+            print(f"  ✓ Full analyzed dataset saved: {full_output}")
+            print(f"    ({len(df)} total assets with AI insights)")
+            
+            # Save summary statistics
+            summary_file = 'analysis_summary.txt'
+            with open(summary_file, 'w') as f:
+                f.write("BELDEN INNOVATE X - PHASE 2 ANALYSIS SUMMARY\n")
+                f.write("=" * 80 + "\n\n")
+                f.write(f"Analysis Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                f.write(f"Total Assets: {len(df)}\n")
+                f.write(f"Critical Risks: {len(anomalies)}\n")
+                f.write(f"Detection Rate: {100*len(anomalies)/len(df):.1f}%\n\n")
+                
+                f.write("Top Issues:\n")
+                for idx, (cause, count) in enumerate(root_cause_counts.head(5).items(), 1):
+                    f.write(f"{idx}. {cause} ({count} cases)\n")
+                
+                if accuracy is not None:
+                    f.write(f"\nModel Accuracy: {accuracy:.1f}%\n")
+                
+                f.write(f"\nFiles Generated:\n")
+                f.write(f"- {OUTPUT_ANOMALY_FILE} (Critical assets report)\n")
+                f.write(f"- {full_output} (Complete analyzed dataset)\n")
+                f.write(f"- {MODEL_FILE} (Trained AI model)\n")
+                if not temporal_df.empty:
+                    f.write(f"- temporal_patterns.csv (Time-series insights)\n")
+            
+            print(f"  ✓ Summary report saved: {summary_file}")
+            
+        except Exception as e:
+            print(f"  ✗ Error saving reports: {e}")
+        
+        # Action recommendations
+        print(f"\n💡 RECOMMENDED ACTIONS")
+        print("-" * 80)
+        
+        critical_count = severity_counts.get('CRITICAL', 0)
+        high_count = severity_counts.get('HIGH', 0)
+        
+        if critical_count > 0:
+            print(f"  🔴 IMMEDIATE (CRITICAL): {critical_count} assets require emergency intervention")
+            critical_assets = df[df['Severity'] == 'CRITICAL'].head(3)
+            for idx, row in critical_assets.iterrows():
+                print(f"     → {row['Asset_ID']}: {row['Root_Cause']}")
+        
+        if high_count > 0:
+            print(f"  🟠 URGENT (HIGH): {high_count} assets need attention within 24 hours")
+        
+        medium_count = severity_counts.get('MEDIUM', 0)
+        if medium_count > 0:
+            print(f"  🟡 SCHEDULE (MEDIUM): {medium_count} assets require planned maintenance")
+        
+        # Security alerts
+        security_issues = anomalies[anomalies['Root_Cause'].str.contains('SECURITY', na=False)]
+        if len(security_issues) > 0:
+            print(f"\n  🔒 SECURITY ALERT: {len(security_issues)} potential cyber threats detected")
+            print(f"     Recommend immediate review of:")
+            for idx, row in security_issues.head(3).iterrows():
+                print(f"     → {row['Asset_ID']}: {row['Root_Cause']}")
+        
+    else:
+        print(f"\n✅ SYSTEM HEALTHY")
+        print("-" * 80)
+        print(f"All {len(df)} monitored assets are operating normally.")
+        print(f"No anomalies detected by AI analysis.")
+        print(f"\nContinue routine monitoring.")
+        
+        # Still save the full dataset with scores
+        full_output = 'belden_network_logs_analyzed.csv'
+        df.to_csv(full_output, index=False)
+        print(f"\nFull dataset with health scores saved: {full_output}")
+    
+    # -------------------------------------------------------------------------
+    # COMPLETION MESSAGE
+    # -------------------------------------------------------------------------
+    print("\n" + "="*80)
+    print("✅ PHASE 2 ANALYSIS COMPLETE")
+    print("="*80)
+    print(f"Execution time: {(datetime.now() - datetime.strptime(datetime.now().strftime('%Y-%m-%d %H:%M:%S'), '%Y-%m-%d %H:%M:%S')).seconds}s")
+    print(f"\n📂 OUTPUT FILES:")
+    print(f"   • {OUTPUT_ANOMALY_FILE} - Critical assets requiring attention")
+    print(f"   • {MODEL_FILE} - Trained AI model (reusable)")
+    print(f"   • belden_network_logs_analyzed.csv - Complete dataset with AI insights")
+    print(f"   • analysis_summary.txt - Executive summary")
+    if not temporal_df.empty:
+        print(f"   • temporal_patterns.csv - Time-series patterns")
+    
+    print(f"\n🎯 NEXT STEPS:")
+    print(f"   1. Review critical assets in {OUTPUT_ANOMALY_FILE}")
+    print(f"   2. Implement recommended actions")
+    print(f"   3. Proceed to Phase 3 (Dashboard Visualization)")
+    print(f"\n" + "="*80 + "\n")
+    
+    return df, anomalies, temporal_df
+
+# ==================================================================================
+# ADDITIONAL UTILITY FUNCTIONS
+# ==================================================================================
+
+def generate_executive_report(df, anomalies):
+    """
+    Generates a concise executive summary for management.
+    """
+    report = []
+    report.append("EXECUTIVE SUMMARY - NETWORK HEALTH ANALYSIS")
+    report.append("=" * 60)
+    report.append(f"Date: {datetime.now().strftime('%Y-%m-%d')}")
+    report.append(f"\nAssets Monitored: {len(df)}")
+    report.append(f"Issues Detected: {len(anomalies)}")
+    
+    if len(anomalies) > 0:
+        critical = len(df[df['Severity'] == 'CRITICAL'])
+        high = len(df[df['Severity'] == 'HIGH'])
+        
+        report.append(f"\nRISK LEVELS:")
+        report.append(f"  Critical: {critical}")
+        report.append(f"  High:     {high}")
+        
+        # Top 3 issues
+        top_issues = anomalies['Root_Cause'].value_counts().head(3)
+        report.append(f"\nTOP ISSUES:")
+        for idx, (issue, count) in enumerate(top_issues.items(), 1):
+            report.append(f"  {idx}. {issue} ({count} cases)")
+        
+        report.append(f"\nRECOMMENDATION: Immediate attention required for {critical + high} assets")
+    else:
+        report.append(f"\nSTATUS: All systems operating normally")
+    
+    return "\n".join(report)
+
+def export_for_dashboard(df, anomalies, output_prefix='dashboard_'):
+    """
+    Exports data in formats optimized for Phase 3 dashboard.
+    """
+    try:
+        # 1. Time series data for charts
+        if 'Timestamp' in df.columns:
+            timeseries = df.groupby('Timestamp').agg({
+                'AI_Risk_Assessment': lambda x: (x == 'CRITICAL_RISK').sum(),
+                'Asset_ID': 'count'
+            }).reset_index()
+            timeseries.columns = ['Timestamp', 'Anomalies', 'Total_Assets']
+            timeseries.to_csv(f'{output_prefix}timeseries.csv', index=False)
+        
+        # 2. Asset summary for dashboard cards
+        asset_summary = df.groupby('Asset_Model').agg({
+            'AI_Risk_Assessment': lambda x: (x == 'CRITICAL_RISK').sum(),
+            'Asset_ID': 'count'
+        }).reset_index()
+        asset_summary.columns = ['Asset_Model', 'Issues', 'Total']
+        asset_summary['Health_Percentage'] = 100 * (1 - asset_summary['Issues'] / asset_summary['Total'])
+        asset_summary.to_csv(f'{output_prefix}asset_summary.csv', index=False)
+        
+        # 3. Severity distribution
+        severity_dist = df['Severity'].value_counts().reset_index()
+        severity_dist.columns = ['Severity', 'Count']
+        severity_dist.to_csv(f'{output_prefix}severity.csv', index=False)
+        
+        print(f"✓ Dashboard data exported with prefix: {output_prefix}")
+        
+    except Exception as e:
+        print(f"⚠ Error exporting dashboard data: {e}")
+
+# ==================================================================================
+# MAIN EXECUTION
+# ==================================================================================
+
+if _name_ == "_main_":
+    try:
+        # Run the complete analysis
+        df_analyzed, anomalies_detected, temporal_patterns = run_ai_analysis()
+        
+        # Optional: Generate additional reports
+        print("Generating additional reports...")
+        
+        # Executive summary
+        exec_report = generate_executive_report(df_analyzed, anomalies_detected)
+        with open('executive_summary.txt', 'w') as f:
+            f.write(exec_report)
+        print("✓ Executive summary saved: executive_summary.txt")
+        
+        # Dashboard exports
+        export_for_dashboard(df_analyzed, anomalies_detected)
+        
+        print("\n🎉 All Phase 2 processing complete!")
+        print("Ready for Phase 3: Dashboard Visualization")
+        
+    except KeyboardInterrupt:
+        print("\n\n⚠  Analysis interrupted by user")
+        sys.exit(0)
+    except Exception as e:
+        print(f"\n❌ FATAL ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
